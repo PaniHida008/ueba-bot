@@ -1,0 +1,7 @@
+sessions/
+*.session
+*.cfg
+phrases/
+cache/
+__pycache__/
+*.pyc
