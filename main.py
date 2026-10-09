@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import time
 import random
 import asyncio
 import importlib.util
@@ -15,6 +16,7 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
     ApiIdInvalidError,
+    FloodWaitError,
 )
 
 init(autoreset=True)
@@ -29,7 +31,7 @@ BANNER = f"""
 ╚██████╔╝███████╗██████╔╝██║  ██║    ██████╔╝╚██████╔╝   ██║   
  ╚═════╝ ╚══════╝╚═════╝ ╚═╝  ╚═╝    ╚═════╝  ╚═════╝    ╚═╝   
 {Style.RESET_ALL}
-{Fore.MAGENTA}              ⚡ UserBot v2.1 ⚡
+{Fore.MAGENTA}              ⚡ UserBot v2.2 ⚡
 {Fore.YELLOW}              by panihida
 {Style.RESET_ALL}
 """
@@ -49,12 +51,11 @@ MODULES_DIR.mkdir(exist_ok=True)
 TAR_TARGETS = {}
 TYPING_TASKS = {}
 PHRASES = []
-
-# Реестр модулей: {name: {"module": obj, "path": Path, "help": str, "cmds": [...]}}
 LOADED_MODULES = {}
-
-# Порядковый номер -> имя модуля (перестраивается при каждом list)
 MODULE_INDEX = []
+
+# 🆕 флаг автоответа на тег/реплаи
+AUTO_REPLY_ENABLED = True
 
 DEFAULT_PHRASES = [
     "ты че такой дерзкий",
@@ -172,13 +173,11 @@ def load_cached_phrases():
 #                    РЕЕСТР МОДУЛЕЙ
 # =========================================================
 def rebuild_index():
-    """Пересобирает нумерованный список модулей (сортировка по имени)."""
     global MODULE_INDEX
     MODULE_INDEX = sorted(LOADED_MODULES.keys())
 
 
 def get_module_by_number(num: int):
-    """Возвращает (name, data) по номеру или (None, None)."""
     rebuild_index()
     if 1 <= num <= len(MODULE_INDEX):
         name = MODULE_INDEX[num - 1]
@@ -187,11 +186,6 @@ def get_module_by_number(num: int):
 
 
 def collect_module_commands(module) -> list:
-    """
-    Ищет в объекте модуля все команды — по атрибуту COMMANDS
-    или по паттернам, если модуль их регистрирует через setup.
-    Модуль может просто объявить список COMMANDS = ['.м-анимация', ...]
-    """
     cmds = getattr(module, "COMMANDS", None)
     if cmds:
         return list(cmds)
@@ -199,7 +193,7 @@ def collect_module_commands(module) -> list:
 
 
 # =========================================================
-#                ЛОГИН
+#                    ЛОГИН
 # =========================================================
 async def login_flow():
     print_banner()
@@ -348,6 +342,8 @@ def build_help_text() -> str:
     pool = PHRASES if PHRASES else DEFAULT_PHRASES
     source = "txt-файл" if PHRASES else "дефолт"
 
+    auto_state = "🟢 вкл" if AUTO_REPLY_ENABLED else "🔴 выкл"
+
     base = (
         "🤖 **UEBA BOT — команды**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -359,6 +355,10 @@ def build_help_text() -> str:
         "   └ _вкл/выкл 'печатает' в текущем чате_\n\n"
         "📊 `.ar`\n"
         "   └ _статистика фраз_\n\n"
+        "🏓 `.пинг`\n"
+        "   └ _пинг бота до Telegram_\n\n"
+        f"📣 `.автоответ` — автоответ на тег: **{auto_state}**\n"
+        "   └ `.автоответ вкл` / `.автоответ выкл` / `.автоответ статус`\n\n"
         "📦 **Модули**\n"
         "   └ `.py` _реплай на .py → установить_\n"
         "   └ `.m` _список модулей с номерами_\n"
@@ -383,6 +383,8 @@ def build_help_text() -> str:
 #                ЗАПУСК ЮЗЕРБОТА
 # =========================================================
 async def start_userbot(session_name: str):
+    global AUTO_REPLY_ENABLED
+
     cfg_path = SESSIONS_DIR / f"{session_name}.cfg"
     if not cfg_path.exists():
         err("Не найден конфиг сессии. Удали .session и зайди заново.")
@@ -413,6 +415,8 @@ async def start_userbot(session_name: str):
         "normalize_text": normalize_text,
         "load_phrases_from_file": load_phrases_from_file,
         "register_module": lambda p: register_module(client, p, ctx),
+        "get_auto_reply": lambda: AUTO_REPLY_ENABLED,
+        "set_auto_reply": lambda v: _set_auto_reply(v),
     }
 
     print()
@@ -427,6 +431,7 @@ async def start_userbot(session_name: str):
         print(f"   Источник: {Fore.CYAN}{PHRASES_FILE}{Style.RESET_ALL}")
     else:
         print(f"   {Fore.YELLOW}txt не загружен — используются дефолтные фразы{Style.RESET_ALL}")
+    print(f"   Автоответ на тег: {Fore.CYAN}{'ВКЛ' if AUTO_REPLY_ENABLED else 'ВЫКЛ'}{Style.RESET_ALL}")
     print(f"{Fore.MAGENTA}═══════════════════════════════════════{Style.RESET_ALL}")
 
     print()
@@ -454,6 +459,139 @@ async def start_userbot(session_name: str):
             pass
 
     # =========================================================
+    #              КОМАНДА .пинг
+    # =========================================================
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.пинг$"))
+    async def ping_cmd(event):
+        global AUTO_REPLY_ENABLED
+
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
+        start = time.perf_counter()
+        try:
+            msg = await client.send_message(event.chat_id, "🏓 _замер..._")
+        except FloodWaitError as e:
+            print(f"[пинг] FloodWait {e.seconds} сек")
+            return
+        except Exception as e:
+            print(f"[пинг] ошибка отправки: {e}")
+            return
+
+        after_send = time.perf_counter()
+
+        t1 = time.perf_counter()
+        try:
+            await msg.edit("🏓 **пинг...**")
+        except FloodWaitError as e:
+            print(f"[пинг] FloodWait {e.seconds} сек")
+            return
+        except Exception as e:
+            print(f"[пинг] ошибка edit: {e}")
+            return
+        after_edit = time.perf_counter()
+
+        send_ms = round((after_send - start) * 1000)
+        edit_ms = round((after_edit - t1) * 1000)
+        total_ms = round((after_edit - start) * 1000)
+
+        if total_ms < 100:
+            quality = "🟢 отлично"
+        elif total_ms < 300:
+            quality = "🟡 нормально"
+        elif total_ms < 800:
+            quality = "🟠 медленно"
+        else:
+            quality = "🔴 плохо"
+
+        text = (
+            f"🏓 **Pong!**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📤 отправка: **{send_ms}** мс\n"
+            f"✏️ редактирование: **{edit_ms}** мс\n"
+            f"⏱ общий round-trip: **{total_ms}** мс\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📶 качество: {quality}"
+        )
+
+        try:
+            await msg.edit(text)
+        except Exception as e:
+            print(f"[пинг] ошибка финального edit: {e}")
+            return
+
+        await asyncio.sleep(10)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    # =========================================================
+    #           КОМАНДА .автоответ (вкл/выкл)
+    # =========================================================
+    @client.on(events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.автоответ(?:\s+(\w+))?$"
+    ))
+    async def auto_reply_cmd(event):
+        global AUTO_REPLY_ENABLED
+
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
+        arg = (event.pattern_match.group(1) or "").strip().lower()
+
+        if arg in ("статус", "status", "?"):
+            state = "🟢 ВКЛ" if AUTO_REPLY_ENABLED else "🔴 ВЫКЛ"
+            m = await client.send_message(
+                event.chat_id,
+                f"📣 **Автоответ на тег:** {state}\n"
+                f"_Управление: `.автоответ` — переключить_",
+            )
+            await asyncio.sleep(8)
+            try:
+                await m.delete()
+            except Exception:
+                pass
+            return
+
+        if arg in ("вкл", "включить", "on", "true", "1"):
+            AUTO_REPLY_ENABLED = True
+            m = await client.send_message(event.chat_id, "🟢 **Автоответ ВКЛЮЧЁН**")
+            await asyncio.sleep(3)
+            try:
+                await m.delete()
+            except Exception:
+                pass
+            return
+
+        if arg in ("выкл", "выключить", "off", "false", "0"):
+            AUTO_REPLY_ENABLED = False
+            m = await client.send_message(event.chat_id, "🔴 **Автоответ ВЫКЛЮЧЕН**")
+            await asyncio.sleep(3)
+            try:
+                await m.delete()
+            except Exception:
+                pass
+            return
+
+        # без аргумента — переключить
+        AUTO_REPLY_ENABLED = not AUTO_REPLY_ENABLED
+        if AUTO_REPLY_ENABLED:
+            m = await client.send_message(event.chat_id, "🟢 **Автоответ ВКЛЮЧЁН**")
+        else:
+            m = await client.send_message(event.chat_id, "🔴 **Автоответ ВЫКЛЮЧЕН**")
+        await asyncio.sleep(3)
+        try:
+            await m.delete()
+        except Exception:
+            pass
+
+    # =========================================================
     #              КОМАНДА .m — список модулей
     # =========================================================
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.m$"))
@@ -466,9 +604,7 @@ async def start_userbot(session_name: str):
         rebuild_index()
 
         if not MODULE_INDEX:
-            msg = await client.send_message(
-                event.chat_id, "📦 **Модулей нет**"
-            )
+            msg = await client.send_message(event.chat_id, "📦 **Модулей нет**")
             await asyncio.sleep(5)
             try:
                 await msg.delete()
@@ -476,10 +612,7 @@ async def start_userbot(session_name: str):
                 pass
             return
 
-        lines = [
-            "📦 **Список модулей**",
-            "━━━━━━━━━━━━━━━━━━━━",
-        ]
+        lines = ["📦 **Список модулей**", "━━━━━━━━━━━━━━━━━━━━"]
         for i, name in enumerate(MODULE_INDEX, 1):
             data = LOADED_MODULES[name]
             h = data["help"]
@@ -498,7 +631,7 @@ async def start_userbot(session_name: str):
             pass
 
     # =========================================================
-    #              КОМАНДА .ms <номер> — инфо
+    #              КОМАНДА .ms <номер>
     # =========================================================
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ms\s*(\d+)$"))
     async def ms_cmd(event):
@@ -513,8 +646,7 @@ async def start_userbot(session_name: str):
         if not name:
             msg = await client.send_message(
                 event.chat_id,
-                f"❌ Нет модуля с номером **{num}**\n"
-                f"Посмотреть список: `.m`"
+                f"❌ Нет модуля с номером **{num}**\nПосмотреть список: `.m`"
             )
             await asyncio.sleep(4)
             try:
@@ -528,7 +660,6 @@ async def start_userbot(session_name: str):
         help_txt = data["help"]
         cmds = data["commands"]
 
-        # размер файла
         try:
             size = path.stat().st_size
             size_txt = f"{size} байт"
@@ -543,15 +674,13 @@ async def start_userbot(session_name: str):
             f"💾 Размер: {size_txt}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
-
         if cmds:
             text += "⚙️ **Команды:**\n"
             for c in cmds:
                 text += f"   • `{c}`\n"
         else:
             text += "⚙️ **Команды:** _не указаны_\n"
-            text += f"   _проверь `.help` или используй префикс `.м-{name}`_\n"
-
+            text += f"   _используй префикс `.м-{name}`_\n"
         text += "━━━━━━━━━━━━━━━━━━━━\n"
         text += f"Удалить: `.md {num}`"
 
@@ -563,7 +692,7 @@ async def start_userbot(session_name: str):
             pass
 
     # =========================================================
-    #              КОМАНДА .md <номер> — удалить
+    #              КОМАНДА .md <номер>
     # =========================================================
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.md\s*(\d+)$"))
     async def md_cmd(event):
@@ -578,8 +707,7 @@ async def start_userbot(session_name: str):
         if not name:
             msg = await client.send_message(
                 event.chat_id,
-                f"❌ Нет модуля с номером **{num}**\n"
-                f"Посмотреть список: `.m`"
+                f"❌ Нет модуля с номером **{num}**\nПосмотреть список: `.m`"
             )
             await asyncio.sleep(4)
             try:
@@ -589,15 +717,11 @@ async def start_userbot(session_name: str):
             return
 
         path = data["path"]
-
-        # удаляем файл
         try:
             if path.exists():
                 path.unlink()
         except Exception as e:
-            msg = await client.send_message(
-                event.chat_id, f"❌ Не смог удалить файл: {e}"
-            )
+            msg = await client.send_message(event.chat_id, f"❌ Не смог удалить файл: {e}")
             await asyncio.sleep(4)
             try:
                 await msg.delete()
@@ -605,14 +729,12 @@ async def start_userbot(session_name: str):
                 pass
             return
 
-        # убираем из реестра
         LOADED_MODULES.pop(name, None)
         rebuild_index()
 
         msg = await client.send_message(
             event.chat_id,
-            f"🗑 **Модуль удалён**\n"
-            f"🧩 #{num} `{name}`\n"
+            f"🗑 **Модуль удалён**\n🧩 #{num} `{name}`\n"
             f"_Хендлеры отключатся после перезапуска бота_",
         )
         await asyncio.sleep(6)
@@ -642,9 +764,7 @@ async def start_userbot(session_name: str):
 
         reply = await event.get_reply_message()
         if not reply or not reply.document:
-            msg = await client.send_message(
-                event.chat_id, "❌ В сообщении нет файла"
-            )
+            msg = await client.send_message(event.chat_id, "❌ В сообщении нет файла")
             await asyncio.sleep(4)
             await msg.delete()
             return
@@ -656,9 +776,7 @@ async def start_userbot(session_name: str):
                 break
 
         if not fname.lower().endswith(".txt"):
-            msg = await client.send_message(
-                event.chat_id, "❌ Нужен именно `.txt` файл"
-            )
+            msg = await client.send_message(event.chat_id, "❌ Нужен именно `.txt` файл")
             await asyncio.sleep(4)
             await msg.delete()
             return
@@ -670,9 +788,7 @@ async def start_userbot(session_name: str):
             await reply.download_media(file=str(download_path))
         except Exception as e:
             err(f"Ошибка скачивания: {e}")
-            msg = await client.send_message(
-                event.chat_id, f"❌ Не смог скачать: {e}"
-            )
+            msg = await client.send_message(event.chat_id, f"❌ Не смог скачать: {e}")
             await asyncio.sleep(4)
             await msg.delete()
             return
@@ -680,9 +796,7 @@ async def start_userbot(session_name: str):
         count = load_phrases_from_file(download_path)
 
         if count == 0:
-            msg = await client.send_message(
-                event.chat_id, "❌ В файле нет валидных фраз"
-            )
+            msg = await client.send_message(event.chat_id, "❌ В файле нет валидных фраз")
             await asyncio.sleep(4)
             await msg.delete()
             return
@@ -690,9 +804,7 @@ async def start_userbot(session_name: str):
         ok(f"Загружено фраз: {count}")
         msg = await client.send_message(
             event.chat_id,
-            f"✅ **Фразы загружены**\n"
-            f"📄 Файл: `{fname}`\n"
-            f"💬 Фраз в базе: **{count}**",
+            f"✅ **Фразы загружены**\n📄 Файл: `{fname}`\n💬 Фраз в базе: **{count}**",
         )
         await asyncio.sleep(5)
         await msg.delete()
@@ -709,13 +821,10 @@ async def start_userbot(session_name: str):
 
         arg = (event.pattern_match.group(1) or "").strip()
 
-        # ---------- .py list ----------
         if arg.lower() in ("list", "список"):
             rebuild_index()
             if not MODULE_INDEX:
-                msg = await client.send_message(
-                    event.chat_id, "📦 Модулей нет"
-                )
+                msg = await client.send_message(event.chat_id, "📦 Модулей нет")
             else:
                 lines = ["📦 **Загруженные модули:**", "━━━━━━━━━━━━━━━━━━"]
                 for i, name in enumerate(MODULE_INDEX, 1):
@@ -723,9 +832,7 @@ async def start_userbot(session_name: str):
                     lines.append(f"`{i}.` 🧩 **{name}** — _{h}_")
                 lines.append("━━━━━━━━━━━━━━━━━━")
                 lines.append(f"Всего: **{len(MODULE_INDEX)}**")
-                msg = await client.send_message(
-                    event.chat_id, "\n".join(lines)
-                )
+                msg = await client.send_message(event.chat_id, "\n".join(lines))
             await asyncio.sleep(15)
             try:
                 await msg.delete()
@@ -733,13 +840,10 @@ async def start_userbot(session_name: str):
                 pass
             return
 
-        # ---------- .py del <имя> ----------
         if arg.lower().startswith(("del ", "удалить ", "удали ")):
             parts = arg.split(maxsplit=1)
             if len(parts) < 2:
-                msg = await client.send_message(
-                    event.chat_id, "❌ `.py del <имя>`"
-                )
+                msg = await client.send_message(event.chat_id, "❌ `.py del <имя>`")
                 await asyncio.sleep(3)
                 await msg.delete()
                 return
@@ -751,9 +855,7 @@ async def start_userbot(session_name: str):
                 try:
                     path.unlink()
                 except Exception as e:
-                    msg = await client.send_message(
-                        event.chat_id, f"❌ Не удалил: {e}"
-                    )
+                    msg = await client.send_message(event.chat_id, f"❌ Не удалил: {e}")
                     await asyncio.sleep(3)
                     await msg.delete()
                     return
@@ -762,14 +864,12 @@ async def start_userbot(session_name: str):
             rebuild_index()
             msg = await client.send_message(
                 event.chat_id,
-                f"🗑 Модуль `{name}` удалён\n"
-                f"_(хендлеры останутся до перезапуска)_",
+                f"🗑 Модуль `{name}` удалён\n_(хендлеры останутся до перезапуска)_",
             )
             await asyncio.sleep(5)
             await msg.delete()
             return
 
-        # ---------- .py (без аргумента) ----------
         if not event.is_reply:
             rebuild_index()
             msg = await client.send_message(
@@ -792,9 +892,7 @@ async def start_userbot(session_name: str):
 
         reply = await event.get_reply_message()
         if not reply or not reply.document:
-            msg = await client.send_message(
-                event.chat_id, "❌ В сообщении нет файла"
-            )
+            msg = await client.send_message(event.chat_id, "❌ В сообщении нет файла")
             await asyncio.sleep(4)
             await msg.delete()
             return
@@ -806,9 +904,7 @@ async def start_userbot(session_name: str):
                 break
 
         if not fname.lower().endswith(".py"):
-            msg = await client.send_message(
-                event.chat_id, "❌ Нужен именно `.py` файл"
-            )
+            msg = await client.send_message(event.chat_id, "❌ Нужен именно `.py` файл")
             await asyncio.sleep(4)
             await msg.delete()
             return
@@ -818,16 +914,13 @@ async def start_userbot(session_name: str):
             safe_name += ".py"
 
         target_path = MODULES_DIR / safe_name
-
         info(f"Скачиваю модуль {fname} → {target_path.name}...")
 
         try:
             await reply.download_media(file=str(target_path))
         except Exception as e:
             err(f"Ошибка скачивания: {e}")
-            msg = await client.send_message(
-                event.chat_id, f"❌ Не смог скачать: {e}"
-            )
+            msg = await client.send_message(event.chat_id, f"❌ Не смог скачать: {e}")
             await asyncio.sleep(4)
             await msg.delete()
             return
@@ -839,10 +932,8 @@ async def start_userbot(session_name: str):
             ok(f"Модуль {target_path.stem} активирован")
             msg = await client.send_message(
                 event.chat_id,
-                f"✅ **Модуль установлен**\n"
-                f"🧩 Имя: `{target_path.stem}`\n"
-                f"📄 Файл: `{safe_name}`\n"
-                f"_Проверить: `.m`_",
+                f"✅ **Модуль установлен**\n🧩 Имя: `{target_path.stem}`\n"
+                f"📄 Файл: `{safe_name}`\n_Проверить: `.m`_",
             )
         else:
             msg = await client.send_message(
@@ -888,6 +979,7 @@ async def start_userbot(session_name: str):
             f"🟢 Таргетов .тар: **{len(TAR_TARGETS)}**\n"
             f"⌨️ Чатов с .тайп: **{len(TYPING_TASKS)}**\n"
             f"📦 Модулей: **{len(LOADED_MODULES)}**\n"
+            f"📣 Автоответ: **{'вкл' if AUTO_REPLY_ENABLED else 'выкл'}**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔺 Самая длинная: _{longest[:60]}_\n"
             f"🔻 Самая короткая: _{shortest[:60]}_"
@@ -913,9 +1005,7 @@ async def start_userbot(session_name: str):
         if not event.is_reply:
             if TAR_TARGETS:
                 TAR_TARGETS.clear()
-                msg = await client.send_message(
-                    event.chat_id, "я те мать убил"
-                )
+                msg = await client.send_message(event.chat_id, "я те мать убил")
                 await asyncio.sleep(3)
                 await msg.delete()
             else:
@@ -938,17 +1028,13 @@ async def start_userbot(session_name: str):
             return
 
         if target is None or not isinstance(target, User):
-            msg = await client.send_message(
-                event.chat_id, "❌ Это не пользователь"
-            )
+            msg = await client.send_message(event.chat_id, "❌ Это не пользователь")
             await asyncio.sleep(3)
             await msg.delete()
             return
 
         if target.id == MY_ID:
-            msg = await client.send_message(
-                event.chat_id, "❌ Нельзя таргетить себя"
-            )
+            msg = await client.send_message(event.chat_id, "❌ Нельзя таргетить себя")
             await asyncio.sleep(3)
             await msg.delete()
             return
@@ -957,14 +1043,10 @@ async def start_userbot(session_name: str):
 
         if target_id in TAR_TARGETS:
             del TAR_TARGETS[target_id]
-            msg = await client.send_message(
-                event.chat_id, "я те мать убил"
-            )
+            msg = await client.send_message(event.chat_id, "я те мать убил")
         else:
             TAR_TARGETS[target_id] = True
-            msg = await client.send_message(
-                event.chat_id, "я тебе мать ебал"
-            )
+            msg = await client.send_message(event.chat_id, "я тебе мать ебал")
         await asyncio.sleep(4)
         await msg.delete()
 
@@ -1048,10 +1130,14 @@ async def start_userbot(session_name: str):
             err(f"Не отправил ответ: {e}")
 
     # =========================================================
-    #           АВТООТВЕТ НА УПОМИНАНИЯ / РЕПЛАИ
+    #      АВТООТВЕТ НА УПОМИНАНИЯ / РЕПЛАИ (управляется флагом)
     # =========================================================
     @client.on(events.NewMessage(incoming=True))
     async def auto_reply(event):
+        # 🆕 проверка флага
+        if not AUTO_REPLY_ENABLED:
+            return
+
         try:
             sender = await event.get_sender()
         except Exception:
@@ -1101,6 +1187,13 @@ async def start_userbot(session_name: str):
             err(f"Автоответ не отправлен: {e}")
 
     await client.run_until_disconnected()
+
+
+def _set_auto_reply(value: bool):
+    """Хелпер для модулей — переключить автоответ."""
+    global AUTO_REPLY_ENABLED
+    AUTO_REPLY_ENABLED = bool(value)
+    return AUTO_REPLY_ENABLED
 
 
 async def main():
